@@ -204,25 +204,28 @@ def train_and_evaluate(
                 num_batches += 1
 
             if accelerator.sync_gradients:
-                completed_steps += 1
                 progress_bar.update(1)
+                completed_steps += 1
 
-                if completed_steps % 100 == 0 and accelerator.is_main_process:
+                if completed_steps % 5 == 0 and accelerator.is_main_process:
                     wandb.log({
                         "train_loss": loss.item(),  
                         "global_step": completed_steps,
                     })
 
-                # 1000 step마다 checkpoint 저장 (메인 프로세스에서만)
+                # checkpoint 저장 및 평가 로직
                 if completed_steps % args.checkpoint_steps == 0:
                     ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
                     accelerator.save_state(ckpt_dir)
                     if accelerator.is_main_process:
                         logger.info("Checkpoint saved at step %d", completed_steps)
 
+                    # 현재까지의 평균 train loss 계산
+                    avg_train_loss = epoch_train_loss / num_batches if num_batches > 0 else float('inf')
+
                     model.eval()
                     losses = []
-                    for batch in eval_dataloader:
+                    for batch in tqdm(eval_dataloader):
                         with torch.no_grad():
                             outputs = model(
                                 input_ids=batch["input_ids"],
@@ -249,22 +252,21 @@ def train_and_evaluate(
                         perplexity,
                     )
 
-                    # WandB에 로그 기록 (메인 프로세스에서만)
+                    # WandB 로깅
                     if accelerator.is_main_process:
-                        wandb.log(
-                            {
-                                "epoch": epoch,
-                                "train_loss": avg_train_loss,
-                                "eval_loss": eval_loss.item(),
-                                "perplexity": perplexity,
-                                "completed_steps": completed_steps,
-                            }
-                        )
+                        wandb.log({
+                            "epoch": epoch,
+                            "train_loss": avg_train_loss,
+                            "eval_loss": eval_loss.item(),
+                            "perplexity": perplexity,
+                            "completed_steps": completed_steps,
+                        })
 
             if completed_steps >= args.max_train_steps:
                 break
 
-        avg_train_loss = epoch_train_loss / num_batches if num_batches > 0 else None
+        # 에포크 종료 시 평균 loss 계산
+        avg_train_loss = epoch_train_loss / num_batches if num_batches > 0 else float('inf')
 
         if completed_steps >= args.max_train_steps:
             break
