@@ -217,7 +217,7 @@ def train_and_evaluate(
                 total_samples = completed_steps * effective_batch_size
 
                 # 100개의 샘플마다 로깅 (배치 크기를 고려)
-                if total_samples - last_saved_samples >= 100 and accelerator.is_main_process:
+                if accelerator.is_main_process:
                     wandb.log({
                         "train_loss": loss.item(),  
                         "global_step": completed_steps,
