@@ -45,8 +45,8 @@ def parse_args():
         default=256,
         help="Max sequence length for tokenization",
     )
-    parser.add_argument("--per_device_train_batch_size", type=int, default=2)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=2)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=12)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=12)
     parser.add_argument("--num_train_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -72,7 +72,7 @@ def load_model_and_tokenizer(args, config):
     """모델과 토크나이저를 로드합니다."""
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name,
-        use_fast=False,
+        use_fast=True,
         model_max_length=args.max_length,
         use_slow_tokenizer=args.use_slow_tokenizer,
         trust_remote_code=args.trust_remote_code,
@@ -167,11 +167,14 @@ def create_dataloaders(train_dataset, val_dataset, args, tokenizer):
         shuffle=True,
         batch_size=args.per_device_train_batch_size,
         collate_fn=data_collator,
+        pin_memory=True,
     )
     eval_dataloader = DataLoader(
         val_dataset,
         batch_size=args.per_device_eval_batch_size,
         collate_fn=data_collator,
+        num_workers=4,
+        pin_memory=True,
     )
     return train_dataloader, eval_dataloader
 
@@ -183,6 +186,7 @@ def train_and_evaluate(
         range(args.max_train_steps), disable=not accelerator.is_local_main_process
     )
     completed_steps = 0
+    last_saved_samples = 0  # 마지막으로 저장된 샘플 수를 추적
 
     for epoch in range(args.num_train_epochs):
         model.train()
@@ -196,7 +200,7 @@ def train_and_evaluate(
                     attention_mask=batch["attention_mask"],
                     labels=batch["labels"],
                 )
-                loss = outputs.loss.mean() / args.gradient_accumulation_steps
+                loss = outputs.loss / args.gradient_accumulation_steps
                 accelerator.backward(loss)
                 optimizer.step()
                 lr_scheduler.step()
@@ -208,18 +212,27 @@ def train_and_evaluate(
                 progress_bar.update(1)
                 completed_steps += 1
 
-                if completed_steps % 5 == 0 and accelerator.is_main_process:
+                # 실제 배치 크기 계산 (배치 크기 * 누적 스텝)
+                effective_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
+                total_samples = completed_steps * effective_batch_size
+
+                # 100개의 샘플마다 로깅 (배치 크기를 고려)
+                if total_samples - last_saved_samples >= 100 and accelerator.is_main_process:
                     wandb.log({
                         "train_loss": loss.item(),  
                         "global_step": completed_steps,
+                        "samples_processed": total_samples,
                     })
 
-                # checkpoint 저장 및 평가 로직
-                if completed_steps % args.checkpoint_steps == 0:
-                    ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
+                # 1000개 이상의 샘플이 처리되었을 때 체크포인트 저장
+                if total_samples - last_saved_samples >= 1000:
+                    ckpt_dir = os.path.join(args.output_dir, f"samples_{total_samples}")
                     accelerator.save_state(ckpt_dir)
                     if accelerator.is_main_process:
-                        logger.info("Checkpoint saved at step %d", completed_steps)
+                        logger.info("Checkpoint saved at %d samples (step %d)", 
+                                  total_samples, 
+                                  completed_steps)
+                    last_saved_samples = total_samples
 
                     # 현재까지의 평균 train loss 계산
                     avg_train_loss = epoch_train_loss / num_batches if num_batches > 0 else float('inf')
@@ -263,14 +276,30 @@ def train_and_evaluate(
                             "completed_steps": completed_steps,
                         })
 
-            if completed_steps >= args.max_train_steps:
-                break
+        # 에포크 종료 시 남은 샘플에 대해 체크포인트 저장
+        if total_samples > last_saved_samples:
+            ckpt_dir = os.path.join(args.output_dir, f"samples_{total_samples}")
+            accelerator.save_state(ckpt_dir)
+            if accelerator.is_main_process:
+                logger.info("Final checkpoint of epoch saved at %d samples (step %d)", 
+                          total_samples, 
+                          completed_steps)
+            last_saved_samples = total_samples
 
         # 에포크 종료 시 평균 loss 계산
         avg_train_loss = epoch_train_loss / num_batches if num_batches > 0 else float('inf')
 
         if completed_steps >= args.max_train_steps:
             break
+
+    # 학습 종료 시 마지막 체크포인트 저장
+    if total_samples > last_saved_samples:
+        ckpt_dir = os.path.join(args.output_dir, f"samples_{total_samples}")
+        accelerator.save_state(ckpt_dir)
+        if accelerator.is_main_process:
+            logger.info("Final checkpoint saved at %d samples (step %d)", 
+                      total_samples, 
+                      completed_steps)
 
     return perplexity
 
