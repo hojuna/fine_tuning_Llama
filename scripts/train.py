@@ -9,7 +9,7 @@ import wandb  # wandb 임포트
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_scheduler
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_scheduler, DataCollatorWithPadding
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument(
         "--max_length",
         type=int,
-        default=1024,
+        default=256,
         help="Max sequence length for tokenization",
     )
     parser.add_argument("--per_device_train_batch_size", type=int, default=2)
@@ -112,6 +112,9 @@ def load_and_preprocess_data(args, accelerator, tokenizer):
     if len(train_dataset) > 10000:
         train_dataset = train_dataset.select(range(10000))
 
+    if len(val_dataset) > 1000:
+        val_dataset = val_dataset.select(range(1000))
+
     logger.info("Dataset columns: %s", dataset["train"].column_names)
 
     def generate_prompt(conversation):
@@ -155,22 +158,20 @@ def load_and_preprocess_data(args, accelerator, tokenizer):
     return tokenized_train, tokenized_val
 
 
-def create_dataloaders(train_dataset, val_dataset, args):
+def create_dataloaders(train_dataset, val_dataset, args, tokenizer):
     """DataLoader 생성 (collate_fn 포함)"""
-    collate_fn = lambda batch: {
-        key: torch.tensor([sample[key] for sample in batch]) for key in batch[0].keys()
-    }
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
     train_dataloader = DataLoader(
         train_dataset,
         shuffle=True,
         batch_size=args.per_device_train_batch_size,
-        collate_fn=collate_fn,
+        collate_fn=data_collator,
     )
     eval_dataloader = DataLoader(
         val_dataset,
         batch_size=args.per_device_eval_batch_size,
-        collate_fn=collate_fn,
+        collate_fn=data_collator,
     )
     return train_dataloader, eval_dataloader
 
@@ -299,7 +300,7 @@ def main():
         args=args, accelerator=accelerator, tokenizer=tokenizer
     )
     train_dataloader, eval_dataloader = create_dataloaders(
-        tokenized_train, tokenized_val, args
+        tokenized_train, tokenized_val, args, tokenizer
     )
 
     no_decay = ["bias", "layer_norm.weight"]
