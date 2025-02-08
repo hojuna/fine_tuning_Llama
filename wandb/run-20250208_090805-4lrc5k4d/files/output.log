@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/root/fine_tuning_Llama/scripts/train.py", line 369, in <module>
+    main()
+  File "/root/fine_tuning_Llama/scripts/train.py", line 295, in main
+    model, tokenizer = load_model_and_tokenizer(args, config)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/fine_tuning_Llama/scripts/train.py", line 86, in load_model_and_tokenizer
+    model = AutoModelForCausalLM.from_pretrained(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: _BaseAutoModelClass.from_pretrained() missing 1 required positional argument: 'pretrained_model_name_or_path'

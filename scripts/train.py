@@ -14,13 +14,6 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_sc
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-# 캐시 경로 설정
-CACHE_DIR = "/home/huggingface_cache"
-os.environ["HF_DATASETS_CACHE"] = os.path.join(CACHE_DIR, "datasets")
-HF_HOME = os.path.join(CACHE_DIR, "hub")
-os.environ["HF_HOME"] = HF_HOME
-os.makedirs(HF_HOME, exist_ok=True)
-
 # 로깅 설정
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -33,7 +26,7 @@ def parse_args():
     parser.add_argument(
         "--local", action="store_true", help="Use local model and dataset cache"
     )
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=3)
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -49,19 +42,18 @@ def parse_args():
     parser.add_argument(
         "--max_length",
         type=int,
-        default=512,
+        default=1024,
         help="Max sequence length for tokenization",
     )
-    parser.add_argument("--per_device_train_batch_size", type=int, default=4)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=4)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=2)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=2)
     parser.add_argument("--num_train_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--num_warmup_steps", type=int, default=0)
     parser.add_argument("--max_train_steps", type=int, default=None)
     parser.add_argument("--lr_scheduler_type", type=str, default="linear")
-    # checkpointing_steps 관련 옵션은 이제 사용하지 않습니다.
-    # parser.add_argument("--checkpointing_steps", type=str, default="epoch")
+    parser.add_argument("--checkpoint_steps", type=int, default=1000)
     parser.add_argument(
         "--trust_remote_code", action="store_true", help="Whether to trust remote code"
     )
@@ -90,26 +82,12 @@ def load_model_and_tokenizer(args, config):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    if args.local:
-        model_path = os.path.join(
-            HF_HOME,
-            "models--meta-llama--Llama-3.2-1B-Instruct",
-            "snapshots",
-            "9213176726f574b556790deb65791e0c5aa438b6",
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            config=config,
-            low_cpu_mem_usage=args.low_cpu_mem_usage,
-            trust_remote_code=args.trust_remote_code,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            config=config,
-            low_cpu_mem_usage=args.low_cpu_mem_usage,
-            trust_remote_code=args.trust_remote_code,
-        )
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        config=config,
+        low_cpu_mem_usage=args.low_cpu_mem_usage,
+        trust_remote_code=args.trust_remote_code,
+    )
 
     # 학습 시 cache 사용하지 않음 (inference에서의 캐싱과 차원 불일치 문제 방지)
     model.config.use_cache = False
@@ -118,13 +96,8 @@ def load_model_and_tokenizer(args, config):
 
 def load_and_preprocess_data(args, accelerator, tokenizer):
     """데이터셋 로드 및 전처리 함수"""
-    if args.local:
-        dataset = load_dataset(
-            "coastral/korean-writing-style-instruct",
-            cache_dir=os.path.join(CACHE_DIR, "datasets", "comoz_cache"),
-        )
-    else:
-        dataset = load_dataset("coastral/korean-writing-style-instruct")
+
+    dataset = load_dataset("coastral/korean-writing-style-instruct")
 
     # train/validation 분리
     if "validation" in dataset.keys():
@@ -234,58 +207,64 @@ def train_and_evaluate(
                 completed_steps += 1
                 progress_bar.update(1)
 
+                if completed_steps % 100 == 0 and accelerator.is_main_process:
+                    wandb.log({
+                        "train_loss": loss.item(),  
+                        "global_step": completed_steps,
+                    })
+
                 # 1000 step마다 checkpoint 저장 (메인 프로세스에서만)
-                if completed_steps % 1000 == 0:
+                if completed_steps % args.checkpoint_steps == 0:
                     ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
                     accelerator.save_state(ckpt_dir)
                     if accelerator.is_main_process:
                         logger.info("Checkpoint saved at step %d", completed_steps)
 
+                    model.eval()
+                    losses = []
+                    for batch in eval_dataloader:
+                        with torch.no_grad():
+                            outputs = model(
+                                input_ids=batch["input_ids"],
+                                attention_mask=batch["attention_mask"],
+                                labels=batch["labels"],
+                            )
+                        loss = outputs.loss
+                        losses.append(
+                            accelerator.gather_for_metrics(
+                                loss.repeat(args.per_device_eval_batch_size)
+                            )
+                        )
+                    losses = torch.cat(losses)
+                    try:
+                        eval_loss = torch.mean(losses)
+                        perplexity = math.exp(eval_loss)
+                    except OverflowError:
+                        perplexity = float("inf")
+                    logger.info(
+                        "Epoch %d - Train Loss: %.4f, Eval Loss: %.4f, Perplexity: %.4f",
+                        epoch,
+                        avg_train_loss,
+                        eval_loss,
+                        perplexity,
+                    )
+
+                    # WandB에 로그 기록 (메인 프로세스에서만)
+                    if accelerator.is_main_process:
+                        wandb.log(
+                            {
+                                "epoch": epoch,
+                                "train_loss": avg_train_loss,
+                                "eval_loss": eval_loss.item(),
+                                "perplexity": perplexity,
+                                "completed_steps": completed_steps,
+                            }
+                        )
+
             if completed_steps >= args.max_train_steps:
                 break
 
         avg_train_loss = epoch_train_loss / num_batches if num_batches > 0 else None
-
-        model.eval()
-        losses = []
-        for batch in eval_dataloader:
-            with torch.no_grad():
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                )
-            loss = outputs.loss
-            losses.append(
-                accelerator.gather_for_metrics(
-                    loss.repeat(args.per_device_eval_batch_size)
-                )
-            )
-        losses = torch.cat(losses)
-        try:
-            eval_loss = torch.mean(losses)
-            perplexity = math.exp(eval_loss)
-        except OverflowError:
-            perplexity = float("inf")
-        logger.info(
-            "Epoch %d - Train Loss: %.4f, Eval Loss: %.4f, Perplexity: %.4f",
-            epoch,
-            avg_train_loss,
-            eval_loss,
-            perplexity,
-        )
-
-        # WandB에 로그 기록 (메인 프로세스에서만)
-        if accelerator.is_main_process:
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "train_loss": avg_train_loss,
-                    "eval_loss": eval_loss.item(),
-                    "perplexity": perplexity,
-                    "completed_steps": completed_steps,
-                }
-            )
 
         if completed_steps >= args.max_train_steps:
             break

@@ -1,0 +1,57 @@
+{
+  "os":  "Linux-6.8.0-1021-gcp-x86_64-with-glibc2.35",
+  "python":  "CPython 3.11.6",
+  "startedAt":  "2025-02-08T09:01:36.412881Z",
+  "args":  [
+    "--local",
+    "--max_length",
+    "512",
+    "--per_device_train_batch_size",
+    "1",
+    "--gradient_accumulation_steps",
+    "4"
+  ],
+  "program":  "/root/fine_tuning_Llama/scripts/train.py",
+  "codePath":  "scripts/train.py",
+  "git":  {
+    "remote":  "https://github.com/hojuna/fine_tuning_Llama",
+    "commit":  "e390db0a817f556c4d55f8a1f411990aa0009064"
+  },
+  "email":  "hojuna123@gmail.com",
+  "root":  "/root/fine_tuning_Llama",
+  "host":  "gpunodebc121yy1apxl7-deployment-fe46eb29eef3170f-699ff85f9p2mj8",
+  "executable":  "/opt/conda/bin/python3.11",
+  "codePathLocal":  "scripts/train.py",
+  "cpu_count":  5,
+  "cpu_count_logical":  10,
+  "gpu":  "Tesla V100-SXM2-16GB",
+  "gpu_count":  2,
+  "disk":  {
+    "/":  {
+      "total":  "636672970752",
+      "used":  "32941678592"
+    }
+  },
+  "memory":  {
+    "total":  "34658136064"
+  },
+  "cpu":  {
+    "count":  5,
+    "countLogical":  10
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "Tesla V100-SXM2-16GB",
+      "memoryTotal":  "17179869184",
+      "cudaCores":  5120,
+      "architecture":  "Volta"
+    },
+    {
+      "name":  "Tesla V100-SXM2-16GB",
+      "memoryTotal":  "17179869184",
+      "cudaCores":  5120,
+      "architecture":  "Volta"
+    }
+  ],
+  "cudaVersion":  "12.4"
+}

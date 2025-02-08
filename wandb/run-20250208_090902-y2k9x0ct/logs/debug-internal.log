@@ -1,0 +1,7 @@
+{"time":"2025-02-08T09:09:02.581381884Z","level":"INFO","msg":"stream: starting","core version":"0.19.6","symlink path":"/root/fine_tuning_Llama/wandb/run-20250208_090902-y2k9x0ct/logs/debug-core.log"}
+{"time":"2025-02-08T09:09:02.684370904Z","level":"INFO","msg":"created new stream","id":"y2k9x0ct"}
+{"time":"2025-02-08T09:09:02.684417314Z","level":"INFO","msg":"stream: started","id":"y2k9x0ct"}
+{"time":"2025-02-08T09:09:02.684443575Z","level":"INFO","msg":"writer: Do: started","stream_id":"y2k9x0ct"}
+{"time":"2025-02-08T09:09:02.684498772Z","level":"INFO","msg":"handler: started","stream_id":"y2k9x0ct"}
+{"time":"2025-02-08T09:09:02.684545544Z","level":"INFO","msg":"sender: started","stream_id":"y2k9x0ct"}
+{"time":"2025-02-08T09:09:02.822382894Z","level":"INFO","msg":"Starting system monitor"}
