@@ -1,15 +1,30 @@
+from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 
 def chatbot():
-    # 모델과 토크나이저 로드
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    print(f"Loading model: {model_name}...")
+    # 원본 모델 경로와 파인튜닝된 모델 경로 설정
+    base_model_name = "meta-llama/Llama-3.2-1B-Instruct"  # 원본 모델
+    model_path = "output/step_230"  # 파인튜닝된 모델 경로
+    print(f"Loading fine-tuned model from: {model_path}...")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    # Accelerator 초기화
+    accelerator = Accelerator()
 
-    # pad_token_id 설정 (없을 경우 eos_token_id 사용)
+    # 원본 모델의 토크나이저와 설정을 사용
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,  # 먼저 원본 모델 구조 로드
+        device_map="auto",
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    )
+
+    # 파인튜닝된 가중치 로드
+    accelerator.load_state(model_path)
+    model = accelerator.unwrap_model(model)
+
+    # pad_token_id 설정
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -28,14 +43,23 @@ def chatbot():
             print("Exiting chatbot. Goodbye!")
             break
 
-        # 모델 예측
+        # 모델 예측을 위한 프롬프트 생성
+        prompt = f"### Instruction:\n{user_input}\n\n### Response:\n"
         response = chat_pipeline(
-            user_input,
-            max_length=100,  # 생성 문장 최대 길이
-            do_sample=True,  # 샘플링 활성화
-            temperature=0.7,  # 샘플링 온도 조정
+            prompt,
+            max_length=250,
+            do_sample=True,
+            temperature=0.7,
         )
-        print(f"Bot: {response[0]['generated_text']}")
+
+        # 응답에서 프롬프트 부분 제거
+        generated_text = response[0]["generated_text"]
+        if "### Response:\n" in generated_text:
+            answer = generated_text.split("### Response:\n")[1].strip()
+        else:
+            answer = generated_text.strip()
+
+        print(f"Bot: {answer}")
 
 
 if __name__ == "__main__":

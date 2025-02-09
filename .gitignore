@@ -1,3 +1,6 @@
 wandb/
 output/
 comoz_cache/
+wandb/debug-internal.log
+wandb/debug.log
+wandb/latest-run
