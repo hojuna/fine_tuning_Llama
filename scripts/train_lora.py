@@ -52,24 +52,29 @@ def parse_args():
         default=1024,
         help="Max sequence length for tokenization",
     )
-    parser.add_argument("--per_device_train_batch_size", type=int, default=16)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=16)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=24)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=24)
     parser.add_argument("--num_train_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=0.01)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--num_warmup_steps", type=int, default=0)
     parser.add_argument("--max_train_steps", type=int, default=None)
-    parser.add_argument("--lr_scheduler_type", type=str, default="linear")
-    parser.add_argument("--checkpoint_steps", type=int, default=1000)
     parser.add_argument(
-        "--trust_remote_code", action="store_true", help="Whether to trust remote code"
+        "--trust_remote_code",
+        type=bool,
+        default=True,
+        help="Whether to trust remote code",
     )
     parser.add_argument(
-        "--low_cpu_mem_usage", action="store_true", help="Enable low CPU memory usage"
+        "--low_cpu_mem_usage",
+        type=bool,
+        default=True,
+        help="Enable low CPU memory usage",
     )
     parser.add_argument(
         "--use_slow_tokenizer",
-        action="store_true",
+        type=bool,
+        default=True,
         help="Use the slow version of the tokenizer",
     )
     parser.add_argument(
@@ -79,6 +84,14 @@ def parse_args():
         help="Dataset path",
     )
     parser.add_argument("--lr_warmup_ratio", type=float, default=0.05)
+    parser.add_argument("--checkpoint_steps", type=int, default=250)
+    parser.add_argument("--eval_interval", type=int, default=25)
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default="20250214_lora",
+        help="Name for the wandb run",
+    )
     return parser.parse_args()
 
 
@@ -111,6 +124,7 @@ def load_model_and_tokenizer(args, config):
         config=config,
         low_cpu_mem_usage=args.low_cpu_mem_usage,
         trust_remote_code=args.trust_remote_code,
+        device_map="auto",
     )
 
     # 학습 시 cache 사용하지 않음 (inference에서의 캐싱과 차원 불일치 문제 방지)
@@ -156,12 +170,12 @@ def load_and_preprocess_data(
         f"분할 후 크기 - Train: {len(data_train)}, Val: {len(data_val)}, Test: {len(data_test)}"
     )
 
-    logger.info("Dataset columns: %s", dataset["train"].column_names)
-
-    def _preprocess_function(prompt):
-        prompt = [generate_prompt(conv) for conv in dataset["train"]["conversations"]]
+    def _preprocess_function(examples):
+        # conversations 필드에서 직접 접근
+        prompts = [generate_prompt(conv) for conv in examples["conversations"]]
+        
         tokenized = tokenizer(
-            prompt,
+            prompts,
             padding="max_length",
             truncation=True,
             max_length=args.max_length,
@@ -229,13 +243,14 @@ def train(
         first_loss.item(),
         first_perplexity,
     )
-    wandb.log(
-        {
-            "epoch": 0,
-            "train_loss": first_loss.item(),
-            "eval_loss": first_loss.item(),
-        }
-    )
+    if accelerator.is_main_process:
+        wandb.log(
+            {
+                "epoch": 0,
+                "train_loss": first_loss.item(),
+                "eval_loss": first_loss.item(),
+            }
+        )
 
     progress_bar = tqdm(
         range(args.max_train_steps),
@@ -281,40 +296,43 @@ def train(
                         }
                     )
 
-                if completed_steps % 10 == 0:
+                if completed_steps % args.checkpoint_steps == 0:
                     ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
                     accelerator.save_state(ckpt_dir)
                     if accelerator.is_main_process:
                         logger.info("Checkpoint saved at step %d", completed_steps)
 
-                    # 현재까지의 평균 train loss 계산
-                    avg_train_loss = (
-                        epoch_train_loss / num_batches
-                        if num_batches > 0
-                        else float("inf")
-                    )
-                    eval_loss, perplexity = evaluate(
-                        args, accelerator, model, eval_dataloader
-                    )
-                    logger.info(
-                        "Epoch %d - Train Loss: %.4f, Eval Loss: %.4f, Perplexity: %.4f",
-                        epoch,
-                        avg_train_loss,
-                        eval_loss,
-                        perplexity,
-                    )
-
-                    # WandB 로깅
+                if completed_steps % args.eval_interval == 0:
                     if accelerator.is_main_process:
-                        wandb.log(
-                            {
-                                "epoch": epoch,
-                                "train_loss": avg_train_loss,
-                                "eval_loss": eval_loss.item(),
-                                "perplexity": perplexity,
-                                "completed_steps": completed_steps,
-                            }
+                        logger.info("Evaluating at step %d", completed_steps)
+                        # 현재까지의 평균 train loss 계산
+                        avg_train_loss = (
+                            epoch_train_loss / num_batches
+                            if num_batches > 0
+                            else float("inf")
                         )
+                        eval_loss, perplexity = evaluate(
+                            args, accelerator, model, eval_dataloader
+                        )
+                        logger.info(
+                            "Epoch %d - Train Loss: %.4f, Eval Loss: %.4f, Perplexity: %.4f",
+                            epoch,
+                            avg_train_loss,
+                            eval_loss,
+                            perplexity,
+                        )
+
+                        # WandB 로깅
+                        if accelerator.is_main_process:
+                            wandb.log(
+                                {
+                                    "epoch": epoch,
+                                    "train_loss": avg_train_loss,
+                                    "eval_loss": eval_loss.item(),
+                                    "perplexity": perplexity,
+                                    "completed_steps": completed_steps,
+                                }
+                            )
 
         ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
         accelerator.save_state(ckpt_dir)
@@ -372,7 +390,11 @@ def main():
 
     # 메인 프로세스에서만 WandB 초기화
     if accelerator.is_main_process:
-        wandb.init(project="fine-tune-llama", config=vars(args))
+        wandb.init(
+            project="fine-tune-llama_02_14",
+            name=args.run_name,
+            config=vars(args)
+        )
 
     config = AutoConfig.from_pretrained(
         args.model_name, trust_remote_code=args.trust_remote_code
