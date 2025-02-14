@@ -5,10 +5,9 @@ import math
 import os
 
 import torch
-import wandb  # wandb 임포트
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import (
@@ -18,6 +17,8 @@ from transformers import (
     DataCollatorWithPadding,
     get_scheduler,
 )
+
+import wandb  # wandb 임포트
 
 # 캐시 경로 설정
 CACHE_DIR = "/home/huggingface_cache"
@@ -58,8 +59,8 @@ def parse_args():
         default=256,
         help="Max sequence length for tokenization",
     )
-    parser.add_argument("--per_device_train_batch_size", type=int, default=32)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=32)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=16)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=16)
     parser.add_argument("--num_train_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -78,6 +79,12 @@ def parse_args():
         action="store_true",
         help="Use the slow version of the tokenizer",
     )
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default="/home/huggingface_cache/datasets/coastral___korean-writing-style-instruct",
+        help="Dataset path",
+    )
     return parser.parse_args()
 
 
@@ -95,26 +102,12 @@ def load_model_and_tokenizer(args, config):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    if args.local:
-        model_path = os.path.join(
-            HF_HOME,
-            "models--meta-llama--Llama-3.2-1B-Instruct",
-            "snapshots",
-            "9213176726f574b556790deb65791e0c5aa438b6",  # 스냅샷 해시
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            config=config,
-            low_cpu_mem_usage=args.low_cpu_mem_usage,
-            trust_remote_code=args.trust_remote_code,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            config=config,
-            low_cpu_mem_usage=args.low_cpu_mem_usage,
-            trust_remote_code=args.trust_remote_code,
-        )
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        config=config,
+        low_cpu_mem_usage=args.low_cpu_mem_usage,
+        trust_remote_code=args.trust_remote_code,
+    )
 
     # 학습 시 cache 사용하지 않음 (inference에서의 캐싱과 차원 불일치 문제 방지)
     model.config.use_cache = False
@@ -125,10 +118,8 @@ def load_and_preprocess_data(args, accelerator, tokenizer):
     """데이터셋 로드 및 전처리 함수"""
 
     if args.local:
-        dataset = load_dataset(
-            "coastral/korean-writing-style-instruct",
-            cache_dir=os.path.join(CACHE_DIR, "datasets", "comoz_cache"),
-        )
+        dataset = load_dataset(os.path.abspath(args.dataset_path))
+
     else:
         dataset = load_dataset("coastral/korean-writing-style-instruct")
 
@@ -214,17 +205,12 @@ def create_dataloaders(train_dataset, val_dataset, args, tokenizer):
 def train_and_evaluate(
     args, accelerator, model, optimizer, lr_scheduler, train_dataloader, eval_dataloader
 ):
-    # max_train_steps가 None이면 전체 에포크 수에 기반하여 계산
-    if args.max_train_steps is None:
-        args.max_train_steps = len(train_dataloader) * args.num_train_epochs
-
     progress_bar = tqdm(
         range(args.max_train_steps),
         disable=not accelerator.is_local_main_process,
         desc="Training Steps",
     )
     completed_steps = 0
-    last_saved_samples = 0  # 마지막으로 저장된 샘플 수를 추적
 
     for epoch in range(args.num_train_epochs):
         model.train()
@@ -250,7 +236,6 @@ def train_and_evaluate(
                 progress_bar.update(1)
                 completed_steps += 1
 
-                # 100개의 샘플마다 로깅 (배치 크기를 고려)
                 if accelerator.is_main_process:
                     wandb.log(
                         {
@@ -259,13 +244,11 @@ def train_and_evaluate(
                         }
                     )
 
-                # 1000개 이상의 샘플이 처리되었을 때 체크포인트 저장
                 if completed_steps % 10 == 0:
                     ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
                     accelerator.save_state(ckpt_dir)
                     if accelerator.is_main_process:
                         logger.info("Checkpoint saved at step %d", completed_steps)
-                    last_saved_samples = completed_steps
 
                     # 현재까지의 평균 train loss 계산
                     avg_train_loss = (
@@ -337,9 +320,6 @@ def train_and_evaluate(
 def main():
     args = parse_args()
 
-    # max_train_steps를 None으로 설정하거나 더 큰 값으로 설정
-    args.max_train_steps = None  # 이렇게 하면 전체 에포크를 다 돕니다
-
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps
     )
@@ -390,8 +370,8 @@ def main():
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps
     )
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+
+    args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
 
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
