@@ -305,11 +305,11 @@ def train(
                     }
                 )
 
-                if completed_steps % args.checkpoint_steps == 0:
-                    ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
-                    accelerator.save_state(ckpt_dir)
-                    if accelerator.is_main_process:
-                        logger.info("Checkpoint saved at step %d", completed_steps)
+            if completed_steps % args.checkpoint_steps == 0:
+                ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
+                accelerator.save_state(ckpt_dir)
+                if accelerator.is_main_process:
+                    logger.info("Checkpoint saved at step %d", completed_steps)
 
             if completed_steps % args.eval_interval == 0:
 
