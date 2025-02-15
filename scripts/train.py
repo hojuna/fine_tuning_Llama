@@ -7,7 +7,7 @@ import os
 import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import (
@@ -15,18 +15,10 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     DataCollatorWithPadding,
-    get_scheduler,
+    get_cosine_schedule_with_warmup,
 )
 
 import wandb  # wandb 임포트
-
-# 캐시 경로 설정
-CACHE_DIR = "/home/huggingface_cache"
-os.environ["HF_DATASETS_CACHE"] = os.path.join(CACHE_DIR, "datasets")
-HF_HOME = os.path.join(CACHE_DIR, "hub")
-os.environ["HF_HOME"] = HF_HOME
-os.makedirs(HF_HOME, exist_ok=True)
-
 
 # 로깅 설정
 logging.basicConfig(
@@ -56,27 +48,32 @@ def parse_args():
     parser.add_argument(
         "--max_length",
         type=int,
-        default=256,
+        default=1024,
         help="Max sequence length for tokenization",
     )
     parser.add_argument("--per_device_train_batch_size", type=int, default=16)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=16)
     parser.add_argument("--num_train_epochs", type=int, default=3)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--learning_rate", type=float, default=0.01)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--num_warmup_steps", type=int, default=0)
     parser.add_argument("--max_train_steps", type=int, default=None)
-    parser.add_argument("--lr_scheduler_type", type=str, default="linear")
-    parser.add_argument("--checkpoint_steps", type=int, default=1000)
     parser.add_argument(
-        "--trust_remote_code", action="store_true", help="Whether to trust remote code"
+        "--trust_remote_code",
+        type=bool,
+        default=True,
+        help="Whether to trust remote code",
     )
     parser.add_argument(
-        "--low_cpu_mem_usage", action="store_true", help="Enable low CPU memory usage"
+        "--low_cpu_mem_usage",
+        type=bool,
+        default=True,
+        help="Enable low CPU memory usage",
     )
     parser.add_argument(
         "--use_slow_tokenizer",
-        action="store_true",
+        type=bool,
+        default=True,
         help="Use the slow version of the tokenizer",
     )
     parser.add_argument(
@@ -85,7 +82,26 @@ def parse_args():
         default="/home/huggingface_cache/datasets/coastral___korean-writing-style-instruct",
         help="Dataset path",
     )
+    parser.add_argument("--lr_warmup_ratio", type=float, default=0.05)
+    parser.add_argument("--checkpoint_steps", type=int, default=250)
+    parser.add_argument("--eval_interval", type=int, default=50)
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default="20250214_lora",
+        help="Name for the wandb run",
+    )
     return parser.parse_args()
+
+
+def generate_prompt(conversation):
+    result = ""
+    for turn in conversation:
+        if turn["from"] == "human":
+            result += f"### Instruction:\n{turn['value']}\n\n"
+        elif turn["from"] == "assistant":
+            result += f"### Response:\n{turn['value']}\n\n"
+    return result.strip()
 
 
 def load_model_and_tokenizer(args, config):
@@ -107,51 +123,48 @@ def load_model_and_tokenizer(args, config):
         config=config,
         low_cpu_mem_usage=args.low_cpu_mem_usage,
         trust_remote_code=args.trust_remote_code,
+        device_map="auto",
     )
 
-    # 학습 시 cache 사용하지 않음 (inference에서의 캐싱과 차원 불일치 문제 방지)
     model.config.use_cache = False
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()  
+    model.gradient_checkpointing_enable()
     return model, tokenizer
 
 
-def load_and_preprocess_data(args, accelerator, tokenizer):
+def load_and_preprocess_data(
+    args, accelerator, tokenizer, train_ratio=0.8, val_ratio=0.1
+):
     """데이터셋 로드 및 전처리 함수"""
 
     if args.local:
-        dataset = load_dataset(os.path.abspath(args.dataset_path))
-
+        dataset = load_dataset(os.path.abspath(args.dataset_path), keep_in_memory=False)
     else:
         dataset = load_dataset("coastral/korean-writing-style-instruct")
 
-    # train/validation 분리
-    if "validation" in dataset.keys():
-        train_dataset = dataset["train"]
-        val_dataset = dataset["validation"]
-    else:
-        split_dataset = dataset["train"].train_test_split(test_size=0.1, seed=42)
-        train_dataset = split_dataset["train"]
-        val_dataset = split_dataset["test"]
+    # 데이터셋 크기 로깅
+    logger.info(f"원본 데이터셋 크기: {len(dataset['train'])}")
 
-    # 학습 데이터셋을 10,000개로 샘플링 (원하는 경우 무작위 샘플링도 고려할 수 있음)
-    if len(train_dataset) > 20000:
-        train_dataset = train_dataset.select(range(20000))
+    # 전체 데이터셋을 랜덤하게 섞은 후 분할
+    shuffled_dataset = dataset["train"].shuffle(seed=42)
 
-    if len(val_dataset) > 2000:
-        val_dataset = val_dataset.select(range(2000))
+    total_size = len(shuffled_dataset)
+    train_size = int(total_size * train_ratio)
+    val_size = int(total_size * val_ratio)
 
-    logger.info("Dataset columns: %s", dataset["train"].column_names)
+    data_train = shuffled_dataset.select(range(train_size))
+    data_val = shuffled_dataset.select(range(train_size, train_size + val_size))
+    data_test = shuffled_dataset.select(range(train_size + val_size, total_size))
 
-    def generate_prompt(conversation):
-        result = ""
-        for turn in conversation:
-            if turn["from"] == "human":
-                result += f"### Instruction:\n{turn['value']}\n\n"
-            elif turn["from"] == "assistant":
-                result += f"### Response:\n{turn['value']}\n\n"
-        return result.strip()
+    logger.info(
+        f"분할 후 크기 - Train: {len(data_train)}, Val: {len(data_val)}, Test: {len(data_test)}"
+    )
 
     def _preprocess_function(examples):
+        # conversations 필드에서 직접 접근
         prompts = [generate_prompt(conv) for conv in examples["conversations"]]
+        
         tokenized = tokenizer(
             prompts,
             padding="max_length",
@@ -170,19 +183,22 @@ def load_and_preprocess_data(args, accelerator, tokenizer):
         return tokenized
 
     with accelerator.main_process_first():
-        tokenized_train = train_dataset.map(
+        tokenized_train = data_train.map(
             _preprocess_function,
             batched=True,
-            remove_columns=train_dataset.column_names,
+            remove_columns=data_train.column_names,
         )
-        tokenized_val = val_dataset.map(
-            _preprocess_function, batched=True, remove_columns=val_dataset.column_names
+        tokenized_val = data_val.map(
+            _preprocess_function, batched=True, remove_columns=data_val.column_names
+        )
+        tokenized_test = data_test.map(
+            _preprocess_function, batched=True, remove_columns=data_test.column_names
         )
 
-    return tokenized_train, tokenized_val
+    return tokenized_train, tokenized_val, tokenized_test
 
 
-def create_dataloaders(train_dataset, val_dataset, args, tokenizer):
+def create_dataloaders(train_dataset, val_dataset, test_dataset, args, tokenizer):
     """DataLoader 생성 (collate_fn 포함)"""
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
@@ -199,12 +215,35 @@ def create_dataloaders(train_dataset, val_dataset, args, tokenizer):
         collate_fn=data_collator,
         pin_memory=True,
     )
-    return train_dataloader, eval_dataloader
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=args.per_device_eval_batch_size,
+        collate_fn=data_collator,
+        pin_memory=True,
+    )
+    return train_dataloader, eval_dataloader, test_dataloader
 
 
-def train_and_evaluate(
+def train(
     args, accelerator, model, optimizer, lr_scheduler, train_dataloader, eval_dataloader
 ):
+    model.eval()
+    first_loss, first_perplexity = evaluate(args, accelerator, model, eval_dataloader)
+    logger.info(
+        "Epoch 0 - Train Loss: N/A, Eval Loss: %.4f, Perplexity: %.4f",
+        first_loss.item(),
+        first_perplexity,
+    )
+    if accelerator.is_main_process:
+        wandb.log(
+            {
+                "epoch": 0,
+                "train_loss": first_loss.item(),
+                "eval_loss": first_loss.item(),
+            }
+        )
+    model.train()
+
     progress_bar = tqdm(
         range(args.max_train_steps),
         disable=not accelerator.is_local_main_process,
@@ -213,71 +252,67 @@ def train_and_evaluate(
     completed_steps = 0
 
     for epoch in range(args.num_train_epochs):
-        model.train()
+
         epoch_train_loss = 0.0
         num_batches = 0
 
+        if hasattr(train_dataloader, "sampler") and hasattr(
+            train_dataloader.sampler, "set_epoch"
+        ):
+            train_dataloader.sampler.set_epoch(epoch)
+
         for batch in train_dataloader:
             with accelerator.accumulate(model):
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                )
-                loss = outputs.loss / args.gradient_accumulation_steps
+                optimizer.zero_grad()
+                
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs = model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                    )
+                    loss = outputs.loss
                 accelerator.backward(loss)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad()
+
                 epoch_train_loss += loss.item()
                 num_batches += 1
 
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                completed_steps += 1
+            completed_steps += 1
+            progress_bar.update(1)
 
-                if accelerator.is_main_process:
-                    wandb.log(
-                        {
-                            "train_loss": loss.item(),
-                            "global_step": completed_steps,
-                        }
-                    )
+            if accelerator.is_main_process:
+                wandb.log(
+                    {
+                        "train_loss": loss.item(),
+                        "global_step": completed_steps,
+                    }
+                )
 
-                if completed_steps % 10 == 0:
+                if completed_steps % args.checkpoint_steps == 0:
                     ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
                     accelerator.save_state(ckpt_dir)
                     if accelerator.is_main_process:
                         logger.info("Checkpoint saved at step %d", completed_steps)
 
+            if completed_steps % args.eval_interval == 0:
+
+                model.eval()
+                eval_loss, perplexity = evaluate(
+                        args, accelerator, model, eval_dataloader
+                    )
+                model.train()
+
+
+                if accelerator.is_main_process:
+                    logger.info("Evaluating at step %d", completed_steps)
                     # 현재까지의 평균 train loss 계산
                     avg_train_loss = (
                         epoch_train_loss / num_batches
                         if num_batches > 0
                         else float("inf")
                     )
-
-                    model.eval()
-                    losses = []
-                    for batch in tqdm(eval_dataloader):
-                        with torch.no_grad():
-                            outputs = model(
-                                input_ids=batch["input_ids"],
-                                attention_mask=batch["attention_mask"],
-                                labels=batch["labels"],
-                            )
-                        loss = outputs.loss
-                        losses.append(
-                            accelerator.gather_for_metrics(
-                                loss.repeat(args.per_device_eval_batch_size)
-                            )
-                        )
-                    losses = torch.cat(losses)
-                    try:
-                        eval_loss = torch.mean(losses)
-                        perplexity = math.exp(eval_loss)
-                    except OverflowError:
-                        perplexity = float("inf")
                     logger.info(
                         "Epoch %d - Train Loss: %.4f, Eval Loss: %.4f, Perplexity: %.4f",
                         epoch,
@@ -314,14 +349,39 @@ def train_and_evaluate(
     if accelerator.is_main_process:
         logger.info("Final checkpoint saved at step %d", completed_steps)
 
-    return perplexity
+
+def evaluate(args, accelerator, model, eval_dataloader):
+
+    losses = []
+    for batch in tqdm(eval_dataloader, desc="Evaluating",disable=not accelerator.is_local_main_process):
+        with torch.no_grad():
+
+            outputs = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"],
+            )
+            loss = outputs.loss
+            losses.append(
+                accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size))
+            )
+    losses = torch.cat(losses)
+    try:
+        eval_loss = torch.mean(losses)
+        perplexity = math.exp(eval_loss)
+    except OverflowError:
+        perplexity = float("inf")
+
+    torch.cuda.empty_cache()
+    return eval_loss, perplexity
 
 
 def main():
     args = parse_args()
 
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision="bf16"
     )
     accelerator.init_trackers("fine-tune-llama", config=vars(args))
     set_seed(42)
@@ -332,18 +392,22 @@ def main():
 
     # 메인 프로세스에서만 WandB 초기화
     if accelerator.is_main_process:
-        wandb.init(project="fine-tune-llama", config=vars(args))
+        wandb.init(
+            project="fine-tune-llama_02_14",
+            name=args.run_name,
+            config=vars(args)
+        )
 
     config = AutoConfig.from_pretrained(
         args.model_name, trust_remote_code=args.trust_remote_code
     )
     model, tokenizer = load_model_and_tokenizer(args, config)
 
-    tokenized_train, tokenized_val = load_and_preprocess_data(
+    tokenized_train, tokenized_val, tokenized_test = load_and_preprocess_data(
         args=args, accelerator=accelerator, tokenizer=tokenizer
     )
-    train_dataloader, eval_dataloader = create_dataloaders(
-        tokenized_train, tokenized_val, args, tokenizer
+    train_dataloader, eval_dataloader, test_dataloader = create_dataloaders(
+        tokenized_train, tokenized_val, tokenized_test, args, tokenizer
     )
 
     no_decay = ["bias", "layer_norm.weight"]
@@ -373,20 +437,19 @@ def main():
 
     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
 
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps,
-    )
+    lr_scheduler = get_cosine_schedule_with_warmup(
 
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = (
+        optimizer,
+        round(args.max_train_steps * args.lr_warmup_ratio),
+        args.max_train_steps,
+    )
+    model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = (
         accelerator.prepare(
-            model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+            model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler
         )
     )
 
-    perplexity = train_and_evaluate(
+    train(
         args,
         accelerator,
         model,
@@ -395,7 +458,8 @@ def main():
         train_dataloader,
         eval_dataloader,
     )
-
+    test_loss, test_perplexity = evaluate(args, accelerator, model, test_dataloader)
+    logger.info("Test Loss: %.4f, Perplexity: %.4f", test_loss.item(), test_perplexity)
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.save_pretrained(
@@ -405,8 +469,6 @@ def main():
     )
     if accelerator.is_main_process:
         tokenizer.save_pretrained(args.output_dir)
-        with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-            json.dump({"perplexity": perplexity}, f)
         wandb.finish()  # WandB 세션 종료
 
 
