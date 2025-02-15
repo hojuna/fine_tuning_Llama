@@ -52,8 +52,8 @@ def parse_args():
         default=1024,
         help="Max sequence length for tokenization",
     )
-    parser.add_argument("--per_device_train_batch_size", type=int, default=24)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=24)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=16)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=16)
     parser.add_argument("--num_train_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=0.01)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -85,7 +85,7 @@ def parse_args():
     )
     parser.add_argument("--lr_warmup_ratio", type=float, default=0.05)
     parser.add_argument("--checkpoint_steps", type=int, default=250)
-    parser.add_argument("--eval_interval", type=int, default=25)
+    parser.add_argument("--eval_interval", type=int, default=50)
     parser.add_argument(
         "--run_name",
         type=str,
@@ -127,18 +127,23 @@ def load_model_and_tokenizer(args, config):
         device_map="auto",
     )
 
-    # 학습 시 cache 사용하지 않음 (inference에서의 캐싱과 차원 불일치 문제 방지)
     model.config.use_cache = False
 
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
         r=8,
-        lora_alpha=32,
+        lora_alpha=16,
         lora_dropout=0.1,
+        bias="none",
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj","lm_head","embed_tokens"],
     )
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
+
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()  
+    model.gradient_checkpointing_enable()
     return model, tokenizer
 
 
@@ -236,7 +241,7 @@ def create_dataloaders(train_dataset, val_dataset, test_dataset, args, tokenizer
 def train(
     args, accelerator, model, optimizer, lr_scheduler, train_dataloader, eval_dataloader
 ):
-
+    model.eval()
     first_loss, first_perplexity = evaluate(args, accelerator, model, eval_dataloader)
     logger.info(
         "Epoch 0 - Train Loss: N/A, Eval Loss: %.4f, Perplexity: %.4f",
@@ -251,6 +256,7 @@ def train(
                 "eval_loss": first_loss.item(),
             }
         )
+    model.train()
 
     progress_bar = tqdm(
         range(args.max_train_steps),
@@ -260,7 +266,7 @@ def train(
     completed_steps = 0
 
     for epoch in range(args.num_train_epochs):
-        model.train()
+
         epoch_train_loss = 0.0
         num_batches = 0
 
@@ -271,30 +277,32 @@ def train(
 
         for batch in train_dataloader:
             with accelerator.accumulate(model):
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                )
-                loss = outputs.loss / args.gradient_accumulation_steps
+                optimizer.zero_grad()
+                
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs = model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                    )
+                    loss = outputs.loss
                 accelerator.backward(loss)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad()
+
                 epoch_train_loss += loss.item()
                 num_batches += 1
 
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                completed_steps += 1
+            completed_steps += 1
+            progress_bar.update(1)
 
-                if accelerator.is_main_process:
-                    wandb.log(
-                        {
-                            "train_loss": loss.item(),
-                            "global_step": completed_steps,
-                        }
-                    )
+            if accelerator.is_main_process:
+                wandb.log(
+                    {
+                        "train_loss": loss.item(),
+                        "global_step": completed_steps,
+                    }
+                )
 
                 if completed_steps % args.checkpoint_steps == 0:
                     ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
@@ -302,37 +310,42 @@ def train(
                     if accelerator.is_main_process:
                         logger.info("Checkpoint saved at step %d", completed_steps)
 
-                if completed_steps % args.eval_interval == 0:
-                    if accelerator.is_main_process:
-                        logger.info("Evaluating at step %d", completed_steps)
-                        # 현재까지의 평균 train loss 계산
-                        avg_train_loss = (
-                            epoch_train_loss / num_batches
-                            if num_batches > 0
-                            else float("inf")
-                        )
-                        eval_loss, perplexity = evaluate(
-                            args, accelerator, model, eval_dataloader
-                        )
-                        logger.info(
-                            "Epoch %d - Train Loss: %.4f, Eval Loss: %.4f, Perplexity: %.4f",
-                            epoch,
-                            avg_train_loss,
-                            eval_loss,
-                            perplexity,
-                        )
+            if completed_steps % args.eval_interval == 0:
 
-                        # WandB 로깅
-                        if accelerator.is_main_process:
-                            wandb.log(
-                                {
-                                    "epoch": epoch,
-                                    "train_loss": avg_train_loss,
-                                    "eval_loss": eval_loss.item(),
-                                    "perplexity": perplexity,
-                                    "completed_steps": completed_steps,
-                                }
-                            )
+                model.eval()
+                eval_loss, perplexity = evaluate(
+                        args, accelerator, model, eval_dataloader
+                    )
+                model.train()
+
+
+                if accelerator.is_main_process:
+                    logger.info("Evaluating at step %d", completed_steps)
+                    # 현재까지의 평균 train loss 계산
+                    avg_train_loss = (
+                        epoch_train_loss / num_batches
+                        if num_batches > 0
+                        else float("inf")
+                    )
+                    logger.info(
+                        "Epoch %d - Train Loss: %.4f, Eval Loss: %.4f, Perplexity: %.4f",
+                        epoch,
+                        avg_train_loss,
+                        eval_loss,
+                        perplexity,
+                    )
+
+                    # WandB 로깅
+                    if accelerator.is_main_process:
+                        wandb.log(
+                            {
+                                "epoch": epoch,
+                                "train_loss": avg_train_loss,
+                                "eval_loss": eval_loss.item(),
+                                "perplexity": perplexity,
+                                "completed_steps": completed_steps,
+                            }
+                        )
 
         ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
         accelerator.save_state(ckpt_dir)
@@ -352,19 +365,20 @@ def train(
 
 
 def evaluate(args, accelerator, model, eval_dataloader):
-    model.eval()
+
     losses = []
-    for batch in tqdm(eval_dataloader):
+    for batch in tqdm(eval_dataloader, desc="Evaluating",disable=not accelerator.is_local_main_process):
         with torch.no_grad():
+
             outputs = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
             )
-        loss = outputs.loss
-        losses.append(
-            accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size))
-        )
+            loss = outputs.loss
+            losses.append(
+                accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size))
+            )
     losses = torch.cat(losses)
     try:
         eval_loss = torch.mean(losses)
@@ -372,6 +386,7 @@ def evaluate(args, accelerator, model, eval_dataloader):
     except OverflowError:
         perplexity = float("inf")
 
+    torch.cuda.empty_cache()
     return eval_loss, perplexity
 
 
@@ -379,7 +394,8 @@ def main():
     args = parse_args()
 
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision="bf16"
     )
     accelerator.init_trackers("fine-tune-llama", config=vars(args))
     set_seed(42)
@@ -436,13 +452,14 @@ def main():
     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
 
     lr_scheduler = get_cosine_schedule_with_warmup(
+
         optimizer,
         round(args.max_train_steps * args.lr_warmup_ratio),
         args.max_train_steps,
     )
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = (
+    model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = (
         accelerator.prepare(
-            model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+            model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler
         )
     )
 
