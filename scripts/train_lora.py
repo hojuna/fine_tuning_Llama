@@ -52,10 +52,10 @@ def parse_args():
         default=1024,
         help="Max sequence length for tokenization",
     )
-    parser.add_argument("--per_device_train_batch_size", type=int, default=16)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=16)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=20)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=20)
     parser.add_argument("--num_train_epochs", type=int, default=3)
-    parser.add_argument("--learning_rate", type=float, default=0.01)
+    parser.add_argument("--learning_rate", type=float, default=0.00316)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--num_warmup_steps", type=int, default=0)
     parser.add_argument("--max_train_steps", type=int, default=None)
@@ -89,20 +89,10 @@ def parse_args():
     parser.add_argument(
         "--run_name",
         type=str,
-        default="20250214_lora",
+        default="llama_lora_02_17",
         help="Name for the wandb run",
     )
     return parser.parse_args()
-
-
-def generate_prompt(conversation):
-    result = ""
-    for turn in conversation:
-        if turn["from"] == "human":
-            result += f"### Instruction:\n{turn['value']}\n\n"
-        elif turn["from"] == "assistant":
-            result += f"### Response:\n{turn['value']}\n\n"
-    return result.strip()
 
 
 def load_model_and_tokenizer(args, config):
@@ -147,6 +137,32 @@ def load_model_and_tokenizer(args, config):
     model.gradient_checkpointing_enable()
     return model, tokenizer
 
+def collate_fn_with_padding(batch, tokenizer, args):
+    input_ids = [item["input_ids"] for item in batch]
+    padded_inputs = tokenizer.pad(
+        {"input_ids": input_ids},
+        padding="longest",
+        max_length=args.max_length,
+        return_tensors="pt"
+    )
+    
+    attention_mask = padded_inputs["attention_mask"]
+    
+    labels = [item["labels"] for item in batch]
+    padded_labels = torch.full(
+        padded_inputs["input_ids"].shape,
+        fill_value=-100,
+        dtype=torch.long
+    )
+    
+    for i, label_seq in enumerate(labels):
+        padded_labels[i, :len(label_seq)] = torch.tensor(label_seq)
+    
+    return {
+        "input_ids": padded_inputs["input_ids"],
+        "attention_mask": attention_mask,
+        "labels": padded_labels
+    }
 
 def load_and_preprocess_data(
     args, accelerator, tokenizer, train_ratio=0.8, val_ratio=0.1
@@ -176,38 +192,52 @@ def load_and_preprocess_data(
         f"분할 후 크기 - Train: {len(data_train)}, Val: {len(data_val)}, Test: {len(data_test)}"
     )
 
-    def _preprocess_function(examples):
-        # conversations 필드에서 직접 접근
-        prompts = [generate_prompt(conv) for conv in examples["conversations"]]
-        
-        tokenized = tokenizer(
-            prompts,
-            padding="max_length",
-            truncation=True,
-            max_length=args.max_length,
-            return_tensors=None,
-        )
-        tokenized["labels"] = tokenized["input_ids"].copy()
-        for i in range(len(tokenized["attention_mask"])):
-            tokenized["labels"][i] = [
-                -100 if mask == 0 else token
-                for mask, token in zip(
-                    tokenized["attention_mask"][i], tokenized["labels"][i]
-                )
-            ]
-        return tokenized
+    def generate_prompt(conversation):
+        instruction = ""
+        response = ""
+        for turn in conversation:
+            if turn["from"] == "human":
+                instruction += turn["value"].strip() + "\n"
+            elif turn["from"] == "gpt":
+                response += turn["value"].strip() + "\n"
+        return instruction.strip(), response.strip()
+
+    def _preprocess_function(examples, tokenizer, max_length):
+        tokens_list = []
+        labels_list = []
+        for example in examples["conversations"]:
+            instruction, response = generate_prompt(example)
+
+            instr_ids = tokenizer(instruction, add_special_tokens=False).input_ids
+            resp_ids = tokenizer(response, add_special_tokens=False).input_ids
+
+            tokens = instr_ids + [tokenizer.eos_token_id] + resp_ids + [tokenizer.eos_token_id]
+
+            labels = [-100] * len(instr_ids) + [-100] + resp_ids + [tokenizer.eos_token_id]
+
+            if len(tokens) > max_length:
+                tokens = tokens[:max_length]
+                labels = labels[:max_length]
+            tokens_list.append(tokens)
+            labels_list.append(labels)
+
+        return {
+            "input_ids": tokens_list,
+            "labels": labels_list            
+        }
+    def preprocess_wrapper(example):
+        return _preprocess_function(example, tokenizer, args.max_length)
+
 
     with accelerator.main_process_first():
         tokenized_train = data_train.map(
-            _preprocess_function,
-            batched=True,
-            remove_columns=data_train.column_names,
+            preprocess_wrapper, batched=True, remove_columns=data_train.column_names
         )
         tokenized_val = data_val.map(
-            _preprocess_function, batched=True, remove_columns=data_val.column_names
+            preprocess_wrapper, batched=True, remove_columns=data_val.column_names
         )
         tokenized_test = data_test.map(
-            _preprocess_function, batched=True, remove_columns=data_test.column_names
+            preprocess_wrapper, batched=True, remove_columns=data_test.column_names
         )
 
     return tokenized_train, tokenized_val, tokenized_test
@@ -215,25 +245,24 @@ def load_and_preprocess_data(
 
 def create_dataloaders(train_dataset, val_dataset, test_dataset, args, tokenizer):
     """DataLoader 생성 (collate_fn 포함)"""
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
     train_dataloader = DataLoader(
         train_dataset,
         shuffle=True,
         batch_size=args.per_device_train_batch_size,
-        collate_fn=data_collator,
+        collate_fn=lambda x: collate_fn_with_padding(x, tokenizer, args),
         pin_memory=True,
     )
     eval_dataloader = DataLoader(
         val_dataset,
         batch_size=args.per_device_eval_batch_size,
-        collate_fn=data_collator,
+        collate_fn=lambda x: collate_fn_with_padding(x, tokenizer, args),
         pin_memory=True,
     )
     test_dataloader = DataLoader(
         test_dataset,
         batch_size=args.per_device_eval_batch_size,
-        collate_fn=data_collator,
+        collate_fn=lambda x: collate_fn_with_padding(x, tokenizer, args),
         pin_memory=True,
     )
     return train_dataloader, eval_dataloader, test_dataloader
@@ -353,12 +382,9 @@ def train(
         if accelerator.is_main_process:
             logger.info("Final checkpoint of epoch saved at step %d", completed_steps)
 
-        # 에포크 종료 시 평균 loss 계산
         avg_train_loss = (
             epoch_train_loss / num_batches if num_batches > 0 else float("inf")
         )
-
-    # 학습 종료 시 마지막 체크포인트 저장
     ckpt_dir = os.path.join(args.output_dir, f"final_checkpoint")
     accelerator.save_state(ckpt_dir)
     if accelerator.is_main_process:
@@ -384,6 +410,8 @@ def evaluate(args, accelerator, model, eval_dataloader):
     try:
         eval_loss = torch.mean(losses)
         perplexity = math.exp(eval_loss)
+        if perplexity > 50:
+            perplexity = float("inf")
     except OverflowError:
         perplexity = float("inf")
 
@@ -408,7 +436,7 @@ def main():
     # 메인 프로세스에서만 WandB 초기화
     if accelerator.is_main_process:
         wandb.init(
-            project="fine-tune-llama_02_14",
+            project="fine-tune-llama_02_17",
             name=args.run_name,
             config=vars(args)
         )
