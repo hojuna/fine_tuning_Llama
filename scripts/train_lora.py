@@ -4,6 +4,7 @@ import logging
 import math
 import os
 
+import bitsandbytes as bnb
 import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -15,6 +16,7 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
+    BitsAndBytesConfig,
     DataCollatorWithPadding,
     get_cosine_schedule_with_warmup,
 )
@@ -52,8 +54,8 @@ def parse_args():
         default=1024,
         help="Max sequence length for tokenization",
     )
-    parser.add_argument("--per_device_train_batch_size", type=int, default=20)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=20)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=1)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
     parser.add_argument("--num_train_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=0.00316)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -97,6 +99,7 @@ def parse_args():
 
 def load_model_and_tokenizer(args, config):
     """모델과 토크나이저를 로드합니다."""
+
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name,
         use_fast=True,
@@ -111,31 +114,47 @@ def load_model_and_tokenizer(args, config):
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
-        config=config,
+        quantization_config=config,
         low_cpu_mem_usage=args.low_cpu_mem_usage,
         trust_remote_code=args.trust_remote_code,
         device_map="auto",
+        attn_implementation="flash_attention_2",
     )
 
     model.config.use_cache = False
 
+    def find_all_linear_names(model):
+        cls = bnb.nn.Linear4bit
+        lora_module_names = set()
+        for name, module in model.named_modules():
+            if isinstance(module, cls):
+                names = name.split(".")
+                lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+        if "lm_head" in lora_module_names:  # needed for 16 bit
+            lora_module_names.remove("lm_head")
+        return list(lora_module_names)
+
+    modules = find_all_linear_names(model)
+
+    print("사용 lora 모듈 : " + ", ".join(modules))
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
-        r=8,
+        r=16,
         lora_alpha=16,
         lora_dropout=0.1,
         bias="none",
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-        #, "gate_proj", "up_proj", "down_proj","lm_head","embed_tokens"
+        target_modules=modules,
+        # , "gate_proj", "up_proj", "down_proj","lm_head","embed_tokens"
     )
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
 
     if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()  
+        model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
     return model, tokenizer
+
 
 def collate_fn_with_padding(batch, tokenizer, args):
     input_ids = [item["input_ids"] for item in batch]
@@ -143,36 +162,35 @@ def collate_fn_with_padding(batch, tokenizer, args):
         {"input_ids": input_ids},
         padding="longest",
         max_length=args.max_length,
-        return_tensors="pt"
+        return_tensors="pt",
     )
-    
+
     attention_mask = padded_inputs["attention_mask"]
-    
+
     labels = [item["labels"] for item in batch]
     padded_labels = torch.full(
-        padded_inputs["input_ids"].shape,
-        fill_value=-100,
-        dtype=torch.long
+        padded_inputs["input_ids"].shape, fill_value=-100, dtype=torch.long
     )
-    
+
     for i, label_seq in enumerate(labels):
-        padded_labels[i, :len(label_seq)] = torch.tensor(label_seq)
-    
+        padded_labels[i, : len(label_seq)] = torch.tensor(label_seq)
+
     return {
         "input_ids": padded_inputs["input_ids"],
         "attention_mask": attention_mask,
-        "labels": padded_labels
+        "labels": padded_labels,
     }
+
 
 def load_and_preprocess_data(
     args, accelerator, tokenizer, train_ratio=0.8, val_ratio=0.1
 ):
     """데이터셋 로드 및 전처리 함수"""
 
-    if args.local:
-        dataset = load_dataset(os.path.abspath(args.dataset_path), keep_in_memory=False)
-    else:
-        dataset = load_dataset("coastral/korean-writing-style-instruct")
+    # if args.local:
+    #     dataset = load_dataset(os.path.abspath(args.dataset_path), keep_in_memory=False)
+    # else:
+    dataset = load_dataset("coastral/korean-writing-style-instruct")
 
     # 데이터셋 크기 로깅
     logger.info(f"원본 데이터셋 크기: {len(dataset['train'])}")
@@ -197,37 +215,40 @@ def load_and_preprocess_data(
         response = ""
         for turn in conversation:
             if turn["from"] == "human":
-                instruction += turn["value"].strip() + "\n"
+                instruction += turn["value"]
             elif turn["from"] == "gpt":
-                response += turn["value"].strip() + "\n"
+                response += turn["value"]
         return instruction.strip(), response.strip()
 
     def _preprocess_function(examples, tokenizer, max_length):
-        tokens_list = []
-        labels_list = []
+        system_instruction = "당신은 한국어 작문 스타일에 대한 전문 지식을 가진 어시스턴트입니다. 사용자의 질문에 대해 상세하고 창의적이며 명확한 답변을 제공해 주세요."
         for example in examples["conversations"]:
             instruction, response = generate_prompt(example)
 
-            instr_ids = tokenizer(instruction, add_special_tokens=False).input_ids
-            resp_ids = tokenizer(response, add_special_tokens=False).input_ids
+            row_json = [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": instruction},
+                {"role": "assistant", "content": response},
+            ]
 
-            tokens = instr_ids + [tokenizer.eos_token_id] + resp_ids + [tokenizer.eos_token_id]
+        prompt = tokenizer.apply_chat_template(
+            row_json,
+            tokenize=True,
+            return_assistant_tokens_mask=True,
+            return_dict=True,
+            max_length=max_length,
+        )
+        # print(prompt)
+        labels = [
+            prompt["input_ids"][index] if mask == 1 else -100
+            for index, mask in enumerate(prompt["attention_mask"])
+        ]
+        prompt["labels"] = labels
 
-            labels = [-100] * len(instr_ids) + [-100] + resp_ids + [tokenizer.eos_token_id]
+        return prompt
 
-            if len(tokens) > max_length:
-                tokens = tokens[:max_length]
-                labels = labels[:max_length]
-            tokens_list.append(tokens)
-            labels_list.append(labels)
-
-        return {
-            "input_ids": tokens_list,
-            "labels": labels_list            
-        }
     def preprocess_wrapper(example):
         return _preprocess_function(example, tokenizer, args.max_length)
-
 
     with accelerator.main_process_first():
         tokenized_train = data_train.map(
@@ -239,7 +260,7 @@ def load_and_preprocess_data(
         tokenized_test = data_test.map(
             preprocess_wrapper, batched=True, remove_columns=data_test.column_names
         )
-
+    print(tokenized_train[0])
     return tokenized_train, tokenized_val, tokenized_test
 
 
@@ -308,7 +329,7 @@ def train(
         for batch in train_dataloader:
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                
+
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     outputs = model(
                         input_ids=batch["input_ids"],
@@ -344,10 +365,9 @@ def train(
 
                 model.eval()
                 eval_loss, perplexity = evaluate(
-                        args, accelerator, model, eval_dataloader
-                    )
+                    args, accelerator, model, eval_dataloader
+                )
                 model.train()
-
 
                 if accelerator.is_main_process:
                     logger.info("Evaluating at step %d", completed_steps)
@@ -394,7 +414,11 @@ def train(
 def evaluate(args, accelerator, model, eval_dataloader):
 
     losses = []
-    for batch in tqdm(eval_dataloader, desc="Evaluating",disable=not accelerator.is_local_main_process):
+    for batch in tqdm(
+        eval_dataloader,
+        desc="Evaluating",
+        disable=not accelerator.is_local_main_process,
+    ):
         with torch.no_grad():
 
             outputs = model(
@@ -404,7 +428,9 @@ def evaluate(args, accelerator, model, eval_dataloader):
             )
             loss = outputs.loss
             losses.append(
-                accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size))
+                accelerator.gather_for_metrics(
+                    loss.repeat(args.per_device_eval_batch_size)
+                )
             )
     losses = torch.cat(losses)
     try:
@@ -424,7 +450,7 @@ def main():
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision="bf16"
+        mixed_precision="bf16",
     )
     accelerator.init_trackers("fine-tune-llama", config=vars(args))
     set_seed(42)
@@ -436,15 +462,16 @@ def main():
     # 메인 프로세스에서만 WandB 초기화
     if accelerator.is_main_process:
         wandb.init(
-            project="fine-tune-llama_02_17",
-            name=args.run_name,
-            config=vars(args)
+            project="fine-tune-llama_02_17", name=args.run_name, config=vars(args)
         )
 
-    config = AutoConfig.from_pretrained(
-        args.model_name, trust_remote_code=args.trust_remote_code
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
     )
-    model, tokenizer = load_model_and_tokenizer(args, config)
+    model, tokenizer = load_model_and_tokenizer(args, bnb_config)
 
     tokenized_train, tokenized_val, tokenized_test = load_and_preprocess_data(
         args=args, accelerator=accelerator, tokenizer=tokenizer
@@ -481,15 +508,24 @@ def main():
     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
 
     lr_scheduler = get_cosine_schedule_with_warmup(
-
         optimizer,
         round(args.max_train_steps * args.lr_warmup_ratio),
         args.max_train_steps,
     )
-    model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = (
-        accelerator.prepare(
-            model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler
-        )
+    (
+        model,
+        optimizer,
+        train_dataloader,
+        eval_dataloader,
+        test_dataloader,
+        lr_scheduler,
+    ) = accelerator.prepare(
+        model,
+        optimizer,
+        train_dataloader,
+        eval_dataloader,
+        test_dataloader,
+        lr_scheduler,
     )
 
     train(
