@@ -19,6 +19,7 @@ from transformers import (
     DataCollatorWithPadding,
     get_cosine_schedule_with_warmup,
 )
+from utils import CHAT_TEMPLATE
 
 import wandb
 
@@ -30,27 +31,71 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Fine-tune LLaMA with Accelerate using apply_chat_template")
-    parser.add_argument("--local", action="store_true", help="Use local model and dataset cache")
+    parser = argparse.ArgumentParser(
+        description="Fine-tune LLaMA with Accelerate using apply_chat_template"
+    )
+    parser.add_argument(
+        "--local", action="store_true", help="Use local model and dataset cache"
+    )
     parser.add_argument("--gradient_accumulation_steps", type=int, default=3)
-    parser.add_argument("--output_dir", type=str, default="output", help="Directory to save checkpoints and final model")
-    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct", help="Model identifier or local path")
-    parser.add_argument("--max_length", type=int, default=1024, help="Max sequence length for tokenization")
-    parser.add_argument("--per_device_train_batch_size", type=int, default=28)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=28)
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="output",
+        help="Directory to save checkpoints and final model",
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="meta-llama/Llama-3.2-1B-Instruct",
+        help="Model identifier or local path",
+    )
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=1024,
+        help="Max sequence length for tokenization",
+    )
+    parser.add_argument("--per_device_train_batch_size", type=int, default=1)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
     parser.add_argument("--num_train_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=0.0001)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--num_warmup_steps", type=int, default=0)
     parser.add_argument("--max_train_steps", type=int, default=None)
-    parser.add_argument("--trust_remote_code", type=bool, default=True, help="Whether to trust remote code")
-    parser.add_argument("--low_cpu_mem_usage", type=bool, default=True, help="Enable low CPU memory usage")
-    parser.add_argument("--use_slow_tokenizer", type=bool, default=True, help="Use the slow version of the tokenizer")
-    parser.add_argument("--dataset_path", type=str, default="/home/huggingface_cache/datasets/coastral___korean-writing-style-instruct", help="Dataset path")
+    parser.add_argument(
+        "--trust_remote_code",
+        type=bool,
+        default=True,
+        help="Whether to trust remote code",
+    )
+    parser.add_argument(
+        "--low_cpu_mem_usage",
+        type=bool,
+        default=True,
+        help="Enable low CPU memory usage",
+    )
+    parser.add_argument(
+        "--use_slow_tokenizer",
+        type=bool,
+        default=True,
+        help="Use the slow version of the tokenizer",
+    )
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default="/home/huggingface_cache/datasets/coastral___korean-writing-style-instruct",
+        help="Dataset path",
+    )
     parser.add_argument("--lr_warmup_ratio", type=float, default=0.05)
     parser.add_argument("--checkpoint_steps", type=int, default=250)
     parser.add_argument("--eval_interval", type=int, default=50)
-    parser.add_argument("--run_name", type=str, default="llama_lora_02_17", help="Name for the wandb run")
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default="llama_lora_02_17",
+        help="Name for the wandb run",
+    )
     return parser.parse_args()
 
 
@@ -73,7 +118,7 @@ def load_model_and_tokenizer(args, config):
         config=config,
         low_cpu_mem_usage=args.low_cpu_mem_usage,
         trust_remote_code=args.trust_remote_code,
-        device_map="auto",
+        # device_map="auto",
     )
     model.config.use_cache = False
 
@@ -84,7 +129,15 @@ def load_model_and_tokenizer(args, config):
         lora_alpha=16,
         lora_dropout=0.1,
         bias="none",
-        target_modules=["gate_proj", "up_proj", "down_proj", "q_proj", "k_proj", "o_proj", "v_proj"],
+        target_modules=[
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "q_proj",
+            "k_proj",
+            "o_proj",
+            "v_proj",
+        ],
     )
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
@@ -95,7 +148,9 @@ def load_model_and_tokenizer(args, config):
     return model, tokenizer
 
 
-def load_and_preprocess_data(args, accelerator, tokenizer, train_ratio=0.8, val_ratio=0.1):
+def load_and_preprocess_data(
+    args, accelerator, tokenizer, train_ratio=0.8, val_ratio=0.1
+):
     """데이터셋 로드 및 전처리 함수"""
     dataset = load_dataset("coastral/korean-writing-style-instruct")
     logger.info(f"원본 데이터셋 크기: {len(dataset['train'])}")
@@ -109,7 +164,9 @@ def load_and_preprocess_data(args, accelerator, tokenizer, train_ratio=0.8, val_
     data_train = shuffled_dataset.select(range(train_size))
     data_val = shuffled_dataset.select(range(train_size, train_size + val_size))
     data_test = shuffled_dataset.select(range(train_size + val_size, total_size))
-    logger.info(f"분할 후 크기 - Train: {len(data_train)}, Val: {len(data_val)}, Test: {len(data_test)}")
+    logger.info(
+        f"분할 후 크기 - Train: {len(data_train)}, Val: {len(data_val)}, Test: {len(data_test)}"
+    )
 
     def generate_prompt(conversation):
         """대화 내용을 기반으로 instruction과 response를 구성합니다."""
@@ -143,15 +200,24 @@ def load_and_preprocess_data(args, accelerator, tokenizer, train_ratio=0.8, val_
             truncation=True,
         )
         # assistant 부분에 해당하는 토큰은 loss를 계산하고, 나머지는 -100으로 마스킹
-        labels = [prompt["input_ids"][i] if mask == 1 else -100 for i, mask in enumerate(prompt["attention_mask"])]
+        labels = [
+            prompt["input_ids"][i] if mask == 1 else -100
+            for i, mask in enumerate(prompt["attention_mask"])
+        ]
         prompt["labels"] = labels
 
         return prompt
 
     with accelerator.main_process_first():
-        tokenized_train = data_train.map(_preprocess_function, batched=False, remove_columns=data_train.column_names)
-        tokenized_val = data_val.map(_preprocess_function, batched=False, remove_columns=data_val.column_names)
-        tokenized_test = data_test.map(_preprocess_function, batched=False, remove_columns=data_test.column_names)
+        tokenized_train = data_train.map(
+            _preprocess_function, batched=False, remove_columns=data_train.column_names
+        )
+        tokenized_val = data_val.map(
+            _preprocess_function, batched=False, remove_columns=data_val.column_names
+        )
+        tokenized_test = data_test.map(
+            _preprocess_function, batched=False, remove_columns=data_test.column_names
+        )
 
     # logger.info(f"토큰화 예시: {tokenized_train[0]}")
     return tokenized_train, tokenized_val, tokenized_test
@@ -182,22 +248,34 @@ def create_dataloaders(train_dataset, val_dataset, test_dataset, args, tokenizer
     return train_dataloader, eval_dataloader, test_dataloader
 
 
-def train(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, eval_dataloader):
+def train(
+    args, accelerator, model, optimizer, lr_scheduler, train_dataloader, eval_dataloader
+):
     model.eval()
     first_loss, first_perplexity = evaluate(args, accelerator, model, eval_dataloader)
-    logger.info("Epoch 0 - Eval Loss: %.4f, Perplexity: %.4f", first_loss.item(), first_perplexity)
+    logger.info(
+        "Epoch 0 - Eval Loss: %.4f, Perplexity: %.4f",
+        first_loss.item(),
+        first_perplexity,
+    )
     if accelerator.is_main_process:
         wandb.log({"epoch": 0, "eval_loss": first_loss.item()})
     model.train()
 
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process, desc="Training Steps")
+    progress_bar = tqdm(
+        range(args.max_train_steps),
+        disable=not accelerator.is_local_main_process,
+        desc="Training Steps",
+    )
     completed_steps = 0
 
     for epoch in range(args.num_train_epochs):
         epoch_train_loss = 0.0
         num_batches = 0
 
-        if hasattr(train_dataloader, "sampler") and hasattr(train_dataloader.sampler, "set_epoch"):
+        if hasattr(train_dataloader, "sampler") and hasattr(
+            train_dataloader.sampler, "set_epoch"
+        ):
             train_dataloader.sampler.set_epoch(epoch)
 
         for batch in train_dataloader:
@@ -231,12 +309,32 @@ def train(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, e
 
             if completed_steps % args.eval_interval == 0:
                 model.eval()
-                eval_loss, perplexity = evaluate(args, accelerator, model, eval_dataloader)
+                eval_loss, perplexity = evaluate(
+                    args, accelerator, model, eval_dataloader
+                )
                 model.train()
                 if accelerator.is_main_process:
-                    avg_train_loss = epoch_train_loss / num_batches if num_batches > 0 else float("inf")
-                    logger.info("Epoch %d - Train Loss: %.4f, Eval Loss: %.4f, Perplexity: %.4f", epoch, avg_train_loss, eval_loss, perplexity)
-                    wandb.log({"epoch": epoch, "train_loss": avg_train_loss, "eval_loss": eval_loss.item(), "perplexity": perplexity, "completed_steps": completed_steps})
+                    avg_train_loss = (
+                        epoch_train_loss / num_batches
+                        if num_batches > 0
+                        else float("inf")
+                    )
+                    logger.info(
+                        "Epoch %d - Train Loss: %.4f, Eval Loss: %.4f, Perplexity: %.4f",
+                        epoch,
+                        avg_train_loss,
+                        eval_loss,
+                        perplexity,
+                    )
+                    wandb.log(
+                        {
+                            "epoch": epoch,
+                            "train_loss": avg_train_loss,
+                            "eval_loss": eval_loss.item(),
+                            "perplexity": perplexity,
+                            "completed_steps": completed_steps,
+                        }
+                    )
 
         ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
         accelerator.save_state(ckpt_dir)
@@ -251,7 +349,11 @@ def train(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, e
 
 def evaluate(args, accelerator, model, eval_dataloader):
     losses = []
-    for batch in tqdm(eval_dataloader, desc="Evaluating", disable=not accelerator.is_local_main_process):
+    for batch in tqdm(
+        eval_dataloader,
+        desc="Evaluating",
+        disable=not accelerator.is_local_main_process,
+    ):
         with torch.no_grad():
             outputs = model(
                 input_ids=batch["input_ids"],
@@ -259,11 +361,14 @@ def evaluate(args, accelerator, model, eval_dataloader):
                 labels=batch["labels"],
             )
             loss = outputs.loss
-            losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
+            losses.append(
+                accelerator.gather_for_metrics(
+                    loss.repeat(args.per_device_eval_batch_size)
+                )
+            )
     losses = torch.cat(losses)
     try:
         eval_loss = torch.mean(losses)
-        perplexity = math.exp(eval_loss)
         if perplexity > 50:
             perplexity = float("inf")
     except OverflowError:
@@ -275,7 +380,10 @@ def evaluate(args, accelerator, model, eval_dataloader):
 
 def main():
     args = parse_args()
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, mixed_precision="bf16")
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision="bf16",
+    )
     accelerator.init_trackers("fine-tune-llama", config=vars(args))
     set_seed(42)
 
@@ -284,28 +392,48 @@ def main():
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
-        wandb.init(project="fine-tune-llama_02_17", name=args.run_name, config=vars(args))
+        wandb.init(
+            project="fine-tune-llama_02_17", name=args.run_name, config=vars(args)
+        )
 
-    config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
+    config = AutoConfig.from_pretrained(
+        args.model_name, trust_remote_code=args.trust_remote_code
+    )
     model, tokenizer = load_model_and_tokenizer(args, config)
 
-    tokenized_train, tokenized_val, tokenized_test = load_and_preprocess_data(args, accelerator, tokenizer)
-    train_dataloader, eval_dataloader, test_dataloader = create_dataloaders(tokenized_train, tokenized_val, tokenized_test, args, tokenizer)
+    tokenizer.chat_template = CHAT_TEMPLATE
+
+    tokenized_train, tokenized_val, tokenized_test = load_and_preprocess_data(
+        args, accelerator, tokenizer
+    )
+    train_dataloader, eval_dataloader, test_dataloader = create_dataloaders(
+        tokenized_train, tokenized_val, tokenized_test, args, tokenizer
+    )
 
     no_decay = ["bias", "layer_norm.weight"]
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if not any(nd in n for nd in no_decay)
+            ],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if any(nd in n for nd in no_decay)
+            ],
             "weight_decay": 0.0,
         },
     ]
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
 
     lr_scheduler = get_cosine_schedule_with_warmup(
@@ -313,17 +441,41 @@ def main():
         round(args.max_train_steps * args.lr_warmup_ratio),
         args.max_train_steps,
     )
-    model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler
+    (
+        model,
+        optimizer,
+        train_dataloader,
+        eval_dataloader,
+        test_dataloader,
+        lr_scheduler,
+    ) = accelerator.prepare(
+        model,
+        optimizer,
+        train_dataloader,
+        eval_dataloader,
+        test_dataloader,
+        lr_scheduler,
     )
 
-    train(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, eval_dataloader)
+    train(
+        args,
+        accelerator,
+        model,
+        optimizer,
+        lr_scheduler,
+        train_dataloader,
+        eval_dataloader,
+    )
     test_loss, test_perplexity = evaluate(args, accelerator, model, test_dataloader)
     logger.info("Test Loss: %.4f, Perplexity: %.4f", test_loss.item(), test_perplexity)
     accelerator.wait_for_everyone()
 
     unwrapped_model = accelerator.unwrap_model(model)
-    unwrapped_model.save_pretrained(args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save)
+    unwrapped_model.save_pretrained(
+        args.output_dir,
+        is_main_process=accelerator.is_main_process,
+        save_function=accelerator.save,
+    )
     if accelerator.is_main_process:
         tokenizer.save_pretrained(args.output_dir)
         wandb.finish()
