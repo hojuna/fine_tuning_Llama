@@ -56,8 +56,8 @@ def parse_args():
         default=1024,
         help="Max sequence length for tokenization",
     )
-    parser.add_argument("--per_device_train_batch_size", type=int, default=1)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=28)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=28)
     parser.add_argument("--num_train_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=0.0001)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -172,7 +172,7 @@ def load_and_preprocess_data(
         """대화 내용을 기반으로 instruction과 response를 구성합니다."""
         instruction = ""
         # 어시스턴트 응답 시작을 명시하기 위해 {% generation %} 태그를 추가
-        response = "{% generation %}"
+        response = ""
         for turn in conversation:
             if turn["from"] == "human":
                 instruction += turn["value"].strip() + "\n"
@@ -367,10 +367,10 @@ def evaluate(args, accelerator, model, eval_dataloader):
                 )
             )
     losses = torch.cat(losses)
+    eval_loss = torch.mean(losses)
+
     try:
-        eval_loss = torch.mean(losses)
-        if perplexity > 50:
-            perplexity = float("inf")
+        perplexity = torch.exp(eval_loss)
     except OverflowError:
         perplexity = float("inf")
 

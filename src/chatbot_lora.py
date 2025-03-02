@@ -1,5 +1,7 @@
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from peft import PeftModel, PeftConfig
+from .utils import CHAT_TEMPLATE  
 
 
 def chatbot():
@@ -13,18 +15,18 @@ def chatbot():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # 시스템 지침(시스템 역할) 설정
     system_instruction = (
         "당신은 한국어 작문 스타일에 대한 전문 지식을 가진 어시스턴트입니다. "
         "사용자의 질문에 대해 상세하고 창의적이며 명확한 답변을 제공해 주세요."
     )
 
-    # 파이프라인 생성
+    # 파이프라인은 루프 밖에서 한 번 생성 (GPU 사용 가능 시 device=0 지정)
     chat_pipeline = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        truncation=True,  # Truncation 활성화
+        truncation=True,
+        device=0 if torch.cuda.is_available() else -1,
     )
 
     print("\nChatbot is ready! Type 'exit' to quit.\n")
@@ -34,12 +36,16 @@ def chatbot():
             print("Exiting chatbot. Goodbye!")
             break
 
-        # 프롬프트 생성: 시스템, 사용자, 어시스턴트 부분을 명확히 구분하고 어시스턴트 응답 시작에 {% generation %} 태그 추가
-        prompt = (
-            f"### System:\n{system_instruction}\n\n"
-            f"### User:\n{user_input}\n\n"
-            f"### Assistant:\n{{% generation %}}"
-        )
+        # 대화 형식을 구성: 시스템, 사용자, 어시스턴트(응답 시작 태그 {% generation %} 포함)
+        conversation = [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": user_input},
+            {"role": "assistant", "content": ""}
+        ]
+
+        # CHAT_TEMPLATE을 적용해 프롬프트 생성 (토큰화 없이 텍스트 형식)
+        prompt = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+
         response = chat_pipeline(
             prompt,
             max_length=1024,
@@ -49,14 +55,9 @@ def chatbot():
 
         generated_text = response[0]["generated_text"]
 
-        # 어시스턴트 응답 부분만 추출 (태그 이후의 텍스트)
-        if "{% generation %}" in generated_text:
-            answer = generated_text.split("{% generation %}", 1)[1].strip()
-        else:
-            answer = generated_text.strip()
+        answer = generated_text.strip()
 
         print(f"Bot: {answer}")
-
 
 if __name__ == "__main__":
     chatbot()
