@@ -19,9 +19,9 @@ from transformers import (
     DataCollatorWithPadding,
     get_cosine_schedule_with_warmup,
 )
-from utils import CHAT_TEMPLATE
 
 import wandb
+from scripts.utils import CHAT_TEMPLATE
 
 # 로깅 설정
 logging.basicConfig(
@@ -200,9 +200,10 @@ def load_and_preprocess_data(
             truncation=True,
         )
         # assistant 부분에 해당하는 토큰은 loss를 계산하고, 나머지는 -100으로 마스킹
+
         labels = [
             prompt["input_ids"][i] if mask == 1 else -100
-            for i, mask in enumerate(prompt["attention_mask"])
+            for i, mask in enumerate(prompt["assistant_masks"])
         ]
         prompt["labels"] = labels
 
@@ -219,7 +220,7 @@ def load_and_preprocess_data(
             _preprocess_function, batched=False, remove_columns=data_test.column_names
         )
 
-    # logger.info(f"토큰화 예시: {tokenized_train[0]}")
+    logger.info(f"토큰화 예시: {tokenized_train[0]}")
     return tokenized_train, tokenized_val, tokenized_test
 
 
